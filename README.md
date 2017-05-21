@@ -1,5 +1,5 @@
 # Download arxiv publications.
-by jaggz.h who is at gmail
+by jaggz.h who is at gmail  
 2017-05-12
 
 ## Downloads the abstract, pdf, and HTTP headers.
