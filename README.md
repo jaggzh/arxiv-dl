@@ -14,7 +14,8 @@ names, citation date, etc.
    * An example arxiv-dlrc is included
 
 ## Usage/examples:
-```arxiv-dl https://arxiv.org/abs/whatever
+```
+arxiv-dl https://arxiv.org/abs/whatever
 arxiv-dl https://arxiv.org/pdf/whatever
 ```
-   (The script will automatically substitute pdf with abs as needed).
+(The script will automatically substitute pdf with abs as needed).
