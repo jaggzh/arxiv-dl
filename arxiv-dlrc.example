@@ -1,0 +1,3 @@
+# Directory for storage of downloaded docs (single level)
+# Modify the folder below, and place this file at {HOME}/.config/arxiv-dl
+libdir = /var/spool/arxiv

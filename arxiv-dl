@@ -1,0 +1,92 @@
+#!/usr/bin/perl
+# Download arxiv publications
+# by jaggz.h who is at gmail
+# 2017-05-12
+
+use strict; use warnings;
+use LWP::UserAgent;
+use File::Slurper qw(write_binary write_text);
+use Config::General;
+
+# Example url:
+# https://arxiv.org/abs/1703.07469
+# https://arxiv.org/pdf/1703.07469
+
+# User-settable...
+my $rc = $ENV{"HOME"} . "/.config/arxiv-dlrc";
+my $tmp = "/tmp/arxiv.org-dl.dat";
+
+# Probably shouldn't change...
+my $rcn_libdir = "libdir"; # RC-Name: Option for library path
+my %config;
+my $conf = Config::General->new($rc);
+die "Missing config: $rc. Need libdir to store downloads! $!"
+	unless defined $conf && (%config = $conf->getall);
+die "Config $rc:\nMissing libdir setting. Where can I store downloads?"
+	unless exists $config{$rcn_libdir};
+my $libdir = $config{$rcn_libdir};
+die "$libdir: Doesn't exist or is unwritable. You fix this for me."
+	if !-d $libdir || !-w $libdir;
+
+if (@ARGV == -1) {
+	print "Usage: arxiv-dl url\n";
+	exit;
+}
+my $url = shift @ARGV;
+my ($url_abs, $url_pdf) = ($url,$url);
+$url_abs =~ s|/pdf/|/abs/|;  # Don't bother testing, but hope. :)
+$url_pdf =~ s|/abs/|/pdf/|;
+
+my $ua = LWP::UserAgent->new(ssl_opts => { verify_hostname => 1 });
+my $res = $ua->get($url_abs);
+die "Couldn't get: $url_abs. " . $res->status_line unless $res->is_success;
+my $content = $res->decoded_content;
+my ($title) = ($content =~ m|<title>(.*?)</title>|);
+if (!defined $title) {
+	print "Could not parse title for html:\n";
+	print ($content =~ /^(([^\r\n]+[\r\n]+){7})/);
+	exit 1;
+}
+
+my $fn_base = clean_title_filename($title);
+my $fn_abs = "$fn_base.html";
+my $fn_pdf = "$fn_base.pdf";
+my $fn_head = "$fn_base.head";
+
+
+print "URL          : $url\n";
+print "URL (absract): $url_abs\n";
+print "Title        : $title\n";
+print "Dest Abstract    :\n" . clean_fn_quoted("$libdir/$fn_abs") . "\n";
+print "Dest PDF         :\n" . clean_fn_quoted("$libdir/$fn_pdf") . "\n";
+print "Dest HTTP Headers:\n" . clean_fn_quoted("$libdir/$fn_head") . "\n";
+
+print "\nHIT ENTER TO ACCEPT"; $|=1;
+<STDIN>;
+
+write_binary("$libdir/$fn_abs", $content);
+write_text("$libdir/$fn_head", $res->headers()->as_string);
+
+$res = $ua->get($url_pdf);
+die "Couldn't get: $url_pdf. " . $res->status_line unless $res->is_success;
+$content = $res->decoded_content;
+write_binary("$libdir/$fn_pdf", $content);
+
+exit;
+
+##############
+
+sub clean_title_filename {
+	my $s = shift;
+	$s =~ s|/|-|g;
+	$s =~ s|\[||g;
+	$s =~ s|\]||g;
+	$s;
+}
+sub clean_fn_quoted {
+	my $s = shift;
+	$s =~ s/"/\\"/g;
+	return '"' . $s . '"';
+}
+
+
