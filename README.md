@@ -2,7 +2,8 @@
 by jaggz.h who is at gmail  
 2017-05-12
 
-## Downloads the abstract, pdf, and HTTP headers.
+## Downloads the abstract, pdf, HTTP headers, and author's source .bin
+## Extracts the bubbly goodness (usually a LaTeX setup)
 The HTTP headers contain X-Meta-Citation information, including the authors'
 names, citation date, etc.
 
@@ -17,5 +18,7 @@ names, citation date, etc.
 ```
 arxiv-dl https://arxiv.org/abs/whatever
 arxiv-dl https://arxiv.org/pdf/whatever
+
+arxiv-dl https://arxiv.org/abs/whatever -s # Get and extract the source
 ```
 (The script will automatically substitute pdf with abs as needed).
