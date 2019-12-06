@@ -1,6 +1,6 @@
 # Download arxiv publications.
 by jaggz.h who is at gmail  
-2017-05-12
+2019-12-06
 
 ## Downloads the abstract, pdf, HTTP headers, and author's source .bin
 ## Extracts the bubbly goodness (usually a LaTeX setup)
