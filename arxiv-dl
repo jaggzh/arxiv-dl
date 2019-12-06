@@ -1,86 +1,412 @@
 #!/usr/bin/perl
 # Download arxiv publications
 # by jaggz.h who is at gmail
+
+# Version history:
 # 2017-05-12
+# 2019-03-22  Fixed bug in binary writing (somehow we made it this long with it buggy)
+
+# Example config file: ~/.config/arxiv-dlrc
+#  libdir = /storage/pub/arxiv.org
 
 use strict; use warnings;
 use LWP::UserAgent;
-use File::Slurper qw(write_binary write_text);
+use File::Slurper qw(write_binary write_text read_binary);
 use Config::General;
+use bansi;
+use Getopt::Long;
+use Date::Parse;
+use File::Copy;
+use Capture::Tiny ':all';
+use File::pushd;
+
+my $opt_get_pdf = 1;
+my $opt_get_src = 0;
+my $opt_get_src_optstr = "-s/--src";
+my $opt_extract = 1;
+
+my $bin_file="/usr/bin/file"; # Util for file types
+if (! -x $bin_file) {
+	$opt_extract = 0;
+	warn "${bred}File type binary ($bin_file) not executable. Disabling extraction.$rst";
+}
+
+my $mime_gzip = "application/gzip";
+my $mime_tar = "application/x-tar";
+
+
+$|=1;
+
+print "\n\n$bgblu$whi", "=" x 70, "$rst\n";
+
+my $opt_force = 0; # Force writing of files if error in names
+                   # (e.g. if arxiv id exists with bad title somehow)
+my $verbose;
+GetOptions(
+		 "verbose"  => \$verbose,
+		 "force|f"  => \$opt_force,
+		 "src|s"  => \$opt_get_src,
+) or die("Error in command line arguments\n");
 
 # Example url:
-# https://arxiv.org/abs/1703.07469
-# https://arxiv.org/pdf/1703.07469
+my @example_urls = qw(
+	https://arxiv.org/abs/1703.07469
+	https://arxiv.org/pdf/1703.07469
+	https://arxiv.org/e-print/1708.00065
+);
 
 # User-settable...
 my $rc = $ENV{"HOME"} . "/.config/arxiv-dlrc";
-my $tmp = "/tmp/arxiv.org-dl.dat";
+my $def_libdir = "/tmp/publications/arxiv";
+my $def_tmpdir = "/tmp/arxiv";
+my $abs_tmp = "$def_tmpdir/arxiv.org-abs-$$.dat";
+my $dat_tmp = "$def_tmpdir/arxiv.org-x-$$.dat";
 
 # Probably shouldn't change...
 my $rcn_libdir = "libdir"; # RC-Name: Option for library path
 my %config;
+if (!-f $rc) {
+	handle_missing_config(); # exit()'s when done
+}
 my $conf = Config::General->new($rc);
-die "Missing config: $rc. Need libdir to store downloads! $!"
-	unless defined $conf && (%config = $conf->getall);
-die "Config $rc:\nMissing libdir setting. Where can I store downloads?"
-	unless exists $config{$rcn_libdir};
-my $libdir = $config{$rcn_libdir};
-die "$libdir: Doesn't exist or is unwritable. You fix this for me."
-	if !-d $libdir || !-w $libdir;
+%config = $conf->getall;
+my $libdir;
+test_paths();
+my $ua = LWP::UserAgent->new(ssl_opts => { verify_hostname => 1 });
 
-if (@ARGV == -1) {
-	print "Usage: arxiv-dl url\n";
+sub test_paths {
+	## Config based paths
+	die "Config $rc:\nMissing libdir setting. Where can I store downloads?"
+		unless exists $config{$rcn_libdir};
+	$libdir = $config{$rcn_libdir};
+	if (!-d $libdir || !-w $libdir) {
+		warn "$bred$libdir: Doesn't exist or is unwritable. Creating.$rst";
+		mkdirfull($libdir);
+	}
+	## Other paths
+	if (!-d $def_tmpdir) {
+		warn "$bred$def_tmpdir: Doesn't exist or is unwritable. Creating.$rst";
+		mkdirfull($def_tmpdir);
+	}
+}
+
+if (@ARGV < 1) {
+	print "\n",
+		"Downloads arxiv.org publications.\n",
+		"Usage: arxiv-dl url\n",
+		"Example urls:\n",
+		map {"  $_\n"} @example_urls;
 	exit;
 }
 my $url = shift @ARGV;
-my ($url_abs, $url_pdf) = ($url,$url);
-$url_abs =~ s|/pdf/|/abs/|;  # Don't bother testing, but hope. :)
-$url_pdf =~ s|/abs/|/pdf/|;
 
-my $ua = LWP::UserAgent->new(ssl_opts => { verify_hostname => 1 });
-my $res = $ua->get($url_abs);
-die "Couldn't get: $url_abs. " . $res->status_line unless $res->is_success;
-my $content = $res->decoded_content;
-my ($title) = ($content =~ m|<title>(.*?)</title>|);
-if (!defined $title) {
-	print "Could not parse title for html:\n";
-	print ($content =~ /^(([^\r\n]+[\r\n]+){7})/);
-	exit 1;
+# If we don't have a local ABS, title and fn_* are left unset
+my $arx = url_to_arxinf($url);
+
+sub url_to_arxinf {
+	# If we don't have a local ABS, title and fn_* are left unset
+	my $u = shift;
+	$u =~ s|\.pdf$||; # Strip optional .pdf extension if it's there
+	print "${yel}URL: $whi$u$rst\n";
+	my ($ubase, $id);
+	#  https://arxiv.org/ pdf/ 1411.0247
+	# (https://arxiv.org)/pdf/(1411.0247)
+	($ubase, $id) = ($u =~ m|^([^/]+//[^/]+)/[^/]+/(.+)$|);
+	die "${bred}I don't understand the URL: $u$rst"
+		if !defined $ubase // $id;
+	my %res;
+	$res{url} = $u;
+	$res{id} = $id;
+	$res{url_base} = $ubase;
+	$res{url_abs} = "$ubase/abs/$id";
+	$res{url_pdf} = "$ubase/pdf/$id";
+	$res{url_src} = "$ubase/e-print/$id";
+	# If we don't have a local ABS, title and fn_title will be undef
+	my ($abs_fn, $title) =
+		find_local_abs_title($id); # If we have this doc already
+	if (defined $title) {
+		$res{title} = $title;
+		my $fn_title = clean_title_filename($res{title});
+		$res{fn_title} = $fn_title;
+		$res{fn_abs} = "$id-$fn_title.abs";
+		$res{fn_pdf} = "$id-$fn_title.pdf";
+		$res{fn_head} = "$id-$fn_title.head";
+		$res{fn_src} = "$id-$fn_title.bin";
+		$res{fn_dir} = "$id-$fn_title";
+	}
+	# If we don't have a local ABS, title and fn_* are left unset
+	\%res;
 }
 
-my $fn_base = clean_title_filename($title);
-my $fn_abs = "$fn_base.html";
-my $fn_pdf = "$fn_base.pdf";
-my $fn_head = "$fn_base.head";
+sub url_to_docid {
+	my $u = shift;
+	$u =~ s|^[^/]+//[^/]+?/[^/]+/||;
+	$u =~ s|\.[^.]+$||;
+	$u;
+}
+sub find_local_abs_title {
+	my $id = shift;
+	print "Checking for $libdir/$id-*.abs\n";
+	my ($abs_fn) = <$libdir/$id-*.abs>;
+	return (undef,undef) if !defined $abs_fn;
+	print "Found ${bgre}local abstract$rst:\n $abs_fn\n";
+	my ($title) = ($abs_fn =~ m|^.*/$id-([^/]*)\.[^.]+$|);
+	print "Title ${bgre}$title$rst\n";
+	if (!defined $title) {
+		die "Invalid local filename w/title: $abs_fn\n" .
+		  "Use --force to re-retrieve"
+			if !$opt_force;
+		return (undef,undef);
+	}
+	$title =~ s/\.\w+$//;           # Strip .extension
+	print "Local existing title:\n",
+		"$whi$title$rst\n";
+	return ($abs_fn, $title);
+}
+sub get_file_mtime { (stat($_[0]))[9]; }
+sub unixtime_to_str { return scalar(localtime $_[0]);
+	#my $s = shift;
+	#my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) =
+		#localtime($s);
+	#$year += 1900;
+	#$mon++;
+}
 
+if (!exists $$arx{title}) {
+	$$arx{move_abs_flag} = 1;
+} else {
+	$$arx{move_abs_flag} = 0;
+	$abs_tmp = "$def_tmpdir/$$arx{fn_abs}";
+	print "$bgblu${whi}Local abstract file is used for mod time:\n";
+	print "$bgblu$yel $abs_tmp$rst\n";
+	$$arx{abs_fn_time} = get_file_mtime($abs_tmp);
+	print "$bgblu${yel} File time:$rst $$arx{abs_fn_time} (",
+		unixtime_to_str($$arx{abs_fn_time}), ")\n";
+}
 
-print "URL          : $url\n";
-print "URL (absract): $url_abs\n";
-print "Title        : $title\n";
-print "Dest Abstract    :\n" . clean_fn_quoted("$libdir/$fn_abs") . "\n";
-print "Dest PDF         :\n" . clean_fn_quoted("$libdir/$fn_pdf") . "\n";
-print "Dest HTTP Headers:\n" . clean_fn_quoted("$libdir/$fn_head") . "\n";
+# If no local ABS, OR if abs is older than X days, get header again
+sub dateolder {
+	my $date = shift;
+	my $expire_days = shift;
+	if ($date < time()-(60*60*24)) { return 1; }
+	return 0;
+}
 
-print "\nHIT ENTER TO ACCEPT"; $|=1;
-<STDIN>;
+my $loabs_expire_days = 1;
+if (defined $$arx{abs_fn_time} &&
+  !dateolder($$arx{abs_fn_time},$loabs_expire_days)) {
+	print "Abstract is not older than $loabs_expire_days. Will not re-retrieve.\n";
+	print "Falsely setting site's modtime to same.\n";
+	$$arx{abs_modtime} = $$arx{abs_fn_time};
+} else {
+	$$arx{abs_httphead} =
+		get_head(name=>"Abstract HEAD", url=>$$arx{url_abs});
+	$$arx{abs_modtime_str} = $$arx{abs_httphead}->{"last-modified"};
+	#Last-Modified: Tue, 08 Aug 2017 00:02:54 GMT
+	$$arx{abs_modtime} = str2time($$arx{abs_modtime_str});
+	print "${bgre}HTTP HEAD Abstract mod time:$rst $$arx{abs_modtime} (",
+		unixtime_to_str($$arx{abs_modtime}), ")\n";
+}
 
-write_binary("$libdir/$fn_abs", $content);
-write_text("$libdir/$fn_head", $res->headers()->as_string);
+my $get_abs = 0;
+if (!defined $$arx{abs_fn_time}) {
+	print "${yel}LOCAL ABSTRACT: None found. ${bcya}Must re-retrieve.$rst\n";
+	$get_abs = 1;
+} elsif ($$arx{abs_fn_time} < $$arx{abs_modtime}) {
+	print "${yel}LOCAL ABSTRACT: Local abstract is outdated. ${bcya}Must re-retrieve$rst\n";
+	$get_abs = 1;
+} else {
+	print "${bcya}LOCAL ABSTRACT: Local abstract is new enough.$rst\n";
+	$get_abs = 0;
+}
 
-$res = $ua->get($url_pdf);
-die "Couldn't get: $url_pdf. " . $res->status_line unless $res->is_success;
-$content = $res->decoded_content;
-write_binary("$libdir/$fn_pdf", $content);
+if ($get_abs) {
+	warn "${bred}Getting doc $$arx{url_abs}$rst";
+	my $content_abs = 
+		get_doc(name=>"Abstract", url=>$$arx{url_abs}, file=>$abs_tmp);
+	my ($title) = ($content_abs =~ m|<title>(.*?)</title>|s);
+	if (!defined $title) {
+		print "Could not parse title for html:\n";
+		print ($content_abs =~ /^(([^\r\n]+[\r\n]+){7})/);
+		exit 1;
+	}
+	# Move a temporary Abstract file into place
+	if ($$arx{move_abs_flag}) {
+		my $fn_title = clean_title_filename($title);
+		my $newabs_fn = "$libdir/$$arx{id}-$fn_title.abs";
+		print "${bmag}Moving temporary ABS into place$rst\n";
+		print " From: $abs_tmp\n";
+		print "   To: $newabs_fn\n";
+		move $abs_tmp, $newabs_fn || die "Couldn't move/cp $abs_tmp to $newabs_fn: $!";
+	}
+	$arx = url_to_arxinf($url);
+}
 
+print "URL           : $url\n";
+print "URL (abstract): $$arx{url_abs}\n";
+print "Title         : $$arx{title}\n";
+print "Dest Abstract:\n "
+	. clean_fn_quoted("$libdir/$$arx{fn_abs}") . "\n";
+print "Dest PDF:\n "
+	. clean_fn_quoted("$libdir/$$arx{fn_pdf}") . "\n";
+print "Dest HTTP Headers:\n "
+	. clean_fn_quoted("$libdir/$$arx{fn_head}") . "\n";
+print "Dest Source/BIN:\n "
+	. clean_fn_quoted("$libdir/$$arx{fn_src}") . "\n";
+
+$|=1;
+print "\n(D) Download files\n";
+print "(S) Skip downloads (if already downloaded)\n";
+print "${whi}Choose:$rst ";
+my $inp=lc <STDIN>;
+
+#write_binary("$libdir/$$arx{fn_abs}", $content);
+#write_text("$libdir/$fn_head", $res->headers()->as_string);
+
+if ($inp =~ /^d/) {
+	if (!$opt_get_pdf) {
+		print "${red}SKIPPING ${yel}pdf (!opt_get_pdf)$rst\n"; 
+	} else {
+		print "${yel}Downloading pdf (!opt_get_pdf)$rst\n"; 
+		get_doc(name=>"PDF",
+			url=>$$arx{url_pdf},
+			file=>"$libdir/$$arx{fn_pdf}");
+		}
+	if (!$opt_get_src) {
+		print "${red}SKIPPING ${yel}bin (!opt_get_src_optstr)$rst\n"; 
+	} else {
+		print "${yel}Downloading src ($$arx{url_src})$rst\n"; 
+		get_doc(name=>"source",
+			url=>$$arx{url_src},
+			file=>"$libdir/$$arx{fn_src}");
+	}
+}
+if (!$opt_get_src) {
+	print "${yel}No .bin extraction done since $opt_get_src_optstr not specified$rst\n";
+} else {
+	extract_source($arx);
+}
 exit;
+
+sub extract_source {
+	my $arx = shift;
+	my $dir = "$libdir/$$arx{fn_dir}";
+	my $srcfile = "$libdir/$$arx{fn_src}";
+	if (-d $dir) {
+		print "${yel}Extraction dir exists:$rst $dir\n";
+	} else {
+		mkdir $dir || die "Can't create dir: $dir";
+	}
+	my $typestr = get_filetype($srcfile);
+
+		# Test if gzipped
+	if ($typestr ne $mime_gzip) {
+		warn "Can't extract, not gzip. Type says {{$typestr}}";
+		# Test if gzip is tar
+	} else {
+		$typestr = get_filetype_gunzipped($srcfile);
+		if ($typestr ne $mime_tar) {
+			warn "Can't extract, not gzipped tar. Type says {{$typestr}}";
+		} else {
+			extract_tar_gz($srcfile, $dir);
+		}
+	}
+}
+sub extract_tar_gz {
+	local $ENV{SRC_FILE} = shift;
+	local $ENV{DEST_DIR} = shift; # Might use in env; might not.
+	{
+		# We'll die() on error, but pushd() should error out on its own.
+		my $dir = pushd($ENV{DEST_DIR}) ||
+			die "Can't pushd($ENV{DEST_DIR}): $!";
+		system('tar -xzvf "$SRC_FILE"');
+		warn "$bgblu${bcya}We've extracted! Check out:\n" .
+			"$yel$ENV{DEST_DIR}$rst";
+	}
+}
+sub get_filetype {
+	local $ENV{MY_PATH} = shift;
+	chomp(my $str = readpipe('file -b --mime-type "$MY_PATH"'));
+	return $str;
+}
+
+sub get_filetype_gunzipped {
+	local $ENV{GZ_PATH} = shift;
+	chomp(my $str = scalar(readpipe('gunzip -c "$GZ_PATH" | file -b --mime-type -')));
+	return $str;
+}
 
 ##############
 
+sub get_head {
+	my %args = @_;
+	die "get_doc missing 'name'" if !exists($args{name});
+	die "get_doc missing 'url'" if !exists($args{url});
+	my $url = $args{url};
+	my $name = $args{name};
+	my $res = $ua->head($url);
+	die "Couldn't get: $url. " . $res->status_line unless $res->is_success;
+	return $res->{_headers}; # hash ref to head headers
+}
+
+sub get_doc {
+	my %args = @_;
+	die "get_doc missing 'name'" if !exists($args{name});
+	die "get_doc missing 'url'" if !exists($args{url});
+	die "get_doc missing local 'file'" if !exists($args{file});
+	my $url = $args{url};
+	my $name = $args{name};
+	my $file = $args{file};
+	my $skiphead = $args{skiphead};
+	my $download = 0;
+
+	if ($skiphead) { $download = 1; }
+	elsif (! -f $file) { $download = 1; }
+	else {
+		my $res = $ua->head($url);
+		die "Couldn't get: $url. " . $res->status_line unless $res->is_success;
+		my $losize = -s $file;
+		#print "RES: $res\n";
+		#print "RES H: $$res{_headers}\n";
+		#print map {"$_ => $$res{_headers}{$_}\n"} keys %{$res->{_headers}};
+		my $remsize = $res->{_headers}->{"content-length"};
+		if (!defined $remsize) {
+			print "${yel}No content-size to check. Downloading again.$rst\n";
+			$download = 1;
+		} elsif ($losize != $remsize) {
+			print "${yel}Local file size ($losize) differs from\n",
+				" content-length ($remsize). Downloading again.$rst\n";
+			$download = 1;
+		}
+	}
+	my $content;
+	my $res;
+	warn "down: $download";
+	if (!$download) {
+		$content = read_binary("$file");
+	} else {
+		print "${yel}Downloading $name$rst ($url)...\n";
+		print " Storing to: $file\n";
+		$res = $ua->get($url);
+		# $res = $ua->get($url, ":content_file" => $file);
+		die "Couldn't get: $url. " . $res->status_line unless $res->is_success;
+		$content = $res->content;
+		#warn "write_binary";
+		write_binary("$file", $content);
+		#warn "/write_binary";
+		# $content = read_binary($file);
+	}
+	return $content;
+}
+
+
 sub clean_title_filename {
 	my $s = shift;
+	$s =~ s|^\[\s*[0-9.]+\s*\]\s*||;
 	$s =~ s|/|-|g;
 	$s =~ s|\[||g;
 	$s =~ s|\]||g;
+	$s =~ s|\s*[\r\n]\s*| |g;
 	$s;
 }
 sub clean_fn_quoted {
@@ -89,4 +415,35 @@ sub clean_fn_quoted {
 	return '"' . $s . '"';
 }
 
+sub mkdirfull {
+	my $full = shift;
+	my @folders = split m|[/\\]|, $full;
+	#print "Folders: ", join(" ", @folders), "\n";
+	if ($full =~ m|^[/\\]|) { # If need / root prefix
+		shift @folders;
+		$folders[0] = substr($full,0,1) . $folders[0];
+	}
+	#print "Folders: ", join(" ", @folders), "\n";
+	map {
+		my $f = $_;
+		#print "$f\n";
+		mkdir $f;
+		chdir $f || die "Can't chdir to $f: $!";
+	} @folders;
+}
 
+sub handle_missing_config {
+	print STDERR
+		"Missing config: $rc.\n",
+		"We need its libdir= setting to store downloads.\n",
+		"Creating $rc with contents:\n",
+		" libdir = $def_libdir\n",
+		"Please modify with your own path.\n";
+	print STDERR "\n<HIT ENTER TO CREATE, CTRL-C to abort>";
+	$|=1;
+	<STDIN>;
+	mkdirfull($def_libdir);
+	write_text("$rc", "libdir = $def_libdir\n");
+	mkdirfull($def_tmpdir);
+	exit(0);
+}
