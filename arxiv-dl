@@ -1,4 +1,5 @@
 #!/usr/bin/perl
+#!/usr/bin/perl -d
 # Download arxiv publications
 # by jaggz.h who is at gmail
 
@@ -22,8 +23,10 @@ use File::pushd;
 
 my $opt_get_pdf = 1;
 my $opt_get_src = 0;
+my $opt_download = 0;
 my $opt_get_src_optstr = "-s/--src";
 my $opt_extract = 1;
+my $opt_help;
 
 my $bin_file="/usr/bin/file"; # Util for file types
 if (! -x $bin_file) {
@@ -42,11 +45,31 @@ print "\n\n$bgblu$whi", "=" x 70, "$rst\n";
 my $opt_force = 0; # Force writing of files if error in names
                    # (e.g. if arxiv id exists with bad title somehow)
 my $verbose;
+sub usage {
+	print <<~'EOT';
+		Usage: arxiv-dl [options] {url}
+		Download arxiv publication data
+
+		URL may be an abs or pdf, it is parsed to get the arxiv id
+		
+		Options:
+		  -v --verbose   Increase verbosity
+		  -f --force     Force dl even if, say, the title was not
+		                 able to be obtained from the arxiv page info
+		  -s --src       Retrieve source files
+		  -d --dl        Download the files without asking
+		  -h --help      Me!
+		EOT
+}
 GetOptions(
-		 "verbose"  => \$verbose,
+		 "verbose|v+"  => \$verbose,
 		 "force|f"  => \$opt_force,
 		 "src|s"  => \$opt_get_src,
+		 "dl|d"  => \$opt_download,
+		 "help|h"  => \$opt_help,
 ) or die("Error in command line arguments\n");
+
+if ($opt_help) { usage(); exit; }
 
 # Example url:
 my @example_urls = qw(
@@ -73,6 +96,11 @@ my $conf = Config::General->new($rc);
 my $libdir;
 test_paths();
 my $ua = LWP::UserAgent->new(ssl_opts => { verify_hostname => 1 });
+$ua->default_header('Accept-Language' => "en-US,en;q=0.8");
+$ua->default_header('Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8');
+#$ua->default_header('Accept-Encoding', 'gzip');
+#$ua->default_header('' => "gzip, deflate, br");
+$ua->agent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.101 Safari/537.36');
 
 sub test_paths {
 	## Config based paths
@@ -111,7 +139,7 @@ sub url_to_arxinf {
 	my ($ubase, $id);
 	#  https://arxiv.org/ pdf/ 1411.0247
 	# (https://arxiv.org)/pdf/(1411.0247)
-	($ubase, $id) = ($u =~ m|^([^/]+//[^/]+)/[^/]+/(.+)$|);
+	($ubase, $id) = ($u =~ m|^([^/]+//[^/]+)/[^/]+/([^/]+)|);
 	die "${bred}I don't understand the URL: $u$rst"
 		if !defined $ubase // $id;
 	my %res;
@@ -122,6 +150,7 @@ sub url_to_arxinf {
 	$res{url_pdf} = "$ubase/pdf/$id";
 	$res{url_src} = "$ubase/e-print/$id";
 	# If we don't have a local ABS, title and fn_title will be undef
+	# $DB::single=1;
 	my ($abs_fn, $title) =
 		find_local_abs_title($id); # If we have this doc already
 	if (defined $title) {
@@ -255,15 +284,18 @@ print "Dest Source/BIN:\n "
 	. clean_fn_quoted("$libdir/$$arx{fn_src}") . "\n";
 
 $|=1;
-print "\n(D) Download files\n";
-print "(S) Skip downloads (if already downloaded)\n";
-print "${whi}Choose:$rst ";
-my $inp=lc <STDIN>;
+if (!$opt_download) {
+	print "\n(D) Download files\n";
+	print "(S) Skip downloads (if already downloaded)\n";
+	print "${whi}Choose:$rst ";
+	my $inp=lc <STDIN>;
+	$opt_download=1 if $inp =~ /^d/;
+}
 
 #write_binary("$libdir/$$arx{fn_abs}", $content);
 #write_text("$libdir/$fn_head", $res->headers()->as_string);
 
-if ($inp =~ /^d/) {
+if ($opt_download) {
 	if (!$opt_get_pdf) {
 		print "${red}SKIPPING ${yel}pdf (!opt_get_pdf)$rst\n"; 
 	} else {
@@ -319,7 +351,7 @@ sub extract_tar_gz {
 		# We'll die() on error, but pushd() should error out on its own.
 		my $dir = pushd($ENV{DEST_DIR}) ||
 			die "Can't pushd($ENV{DEST_DIR}): $!";
-		system('tar -xzvf "$SRC_FILE"');
+		system(qw(tar -xzv --force-local -f), $ENV{SRC_FILE});
 		warn "$bgblu${bcya}We've extracted! Check out:\n" .
 			"$yel$ENV{DEST_DIR}$rst";
 	}
