@@ -122,6 +122,7 @@ if (@ARGV < 1) {
 	print "\n",
 		"Downloads arxiv.org publications.\n",
 		"Usage: arxiv-dl url\n",
+		"Storage dir: $libdir\n",
 		"Example urls:\n",
 		map {"  $_\n"} @example_urls;
 	exit;
